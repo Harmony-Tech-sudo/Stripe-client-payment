@@ -281,4 +281,4 @@ MIT (change this to the license you prefer, and add a `LICENSE` file).
 
 ## Author
 
-Built by **Charles**, AI automation specialist. Contact: `your-email@example.com`
+Built by **Charles**, AI automation specialist. Contact: `marvelsworld01@gmail.com`
