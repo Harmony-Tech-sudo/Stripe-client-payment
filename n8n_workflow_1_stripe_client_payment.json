@@ -1,0 +1,1350 @@
+{
+  "name": "Workflow 1 - Stripe Client Payment to Receipt Email",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Workflow 1: Stripe client payment -> ERP -> receipt -> email\n\n**Before activating**\n1. Run schema.sql in Postgres\n2. Edit the secret in **Verify Signature** and the constants in **Config & Event**\n3. Set env `NODE_FUNCTION_ALLOW_BUILTIN=crypto`\n4. Assign credentials: Stripe API, Postgres, SMTP, AWS S3, Header Auth (ERP)\n5. Run Gotenberg (HTML to PDF) and set its URL\n6. In Stripe, point a webhook endpoint at the **production** URL of the Stripe Webhook node\n\n**Stripe events to enable:** invoice.finalized, invoice.paid, invoice.payment_failed, charge.dispute.created, credit_note.created\n\nSet an Error Workflow in workflow settings so failed runs alert Finance.",
+        "height": 380,
+        "width": 520,
+        "color": 4
+      },
+      "id": "8788be02-78df-41ee-93cb-2bfc9b5d62a4",
+      "name": "Setup Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -120,
+        -520
+      ]
+    },
+    {
+      "parameters": {
+        "content": "**Critical gate**\nSignature verified on the raw body, replay window checked, event de-duplicated by event ID (zero rows returned = duplicate = run stops).",
+        "height": 200,
+        "width": 560,
+        "color": 3
+      },
+      "id": "0df5ace1-61b4-4cf2-85d2-bbba7a83b561",
+      "name": "Note: Gate",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        440,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "content": "**invoice.paid path**\nRe-fetch from Stripe -> validate -> post to ERP -> receipt PDF -> hash -> store -> email -> audit log. Any mismatch goes to the exception queue, never auto-posts.",
+        "height": 140,
+        "width": 900,
+        "color": 5
+      },
+      "id": "da5fc3e7-376a-452f-853c-f552c99b2cc5",
+      "name": "Note: Paid",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1900,
+        -170
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "stripe-client-payments",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "d7dd43ab-b868-46d8-82b1-11a7ef0fc5eb",
+      "name": "Stripe Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "32037bb6-0bf8-4fa9-9fcf-464d1bc2d2ea"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Stripe signature check: HMAC-SHA256 over `${timestamp}.${rawBody}`\n// Needs env NODE_FUNCTION_ALLOW_BUILTIN=crypto\nconst crypto = require('crypto');\nconst WEBHOOK_SECRET = 'whsec_REPLACE_ME';   // move to an env var or secret store in production\nconst TOLERANCE_SECONDS = 300;\n\nconst bad = (reason) => [{ json: { valid: false, reason } }];\n\nconst headers = $input.first().json.headers || {};\nconst sigHeader = headers['stripe-signature'];\nif (!sigHeader) return bad('missing_signature_header');\n\nlet rawBody;\ntry {\n  const buf = await this.helpers.getBinaryDataBuffer(0, 'data');\n  rawBody = buf.toString('utf8');\n} catch (e) {\n  return bad('no_raw_body');\n}\n\nlet t = null;\nconst v1 = [];\nfor (const part of sigHeader.split(',')) {\n  const [k, v] = part.split('=');\n  if (k === 't') t = v;\n  if (k === 'v1') v1.push(v);\n}\nif (!t || v1.length === 0) return bad('malformed_signature_header');\n\nconst expected = crypto.createHmac('sha256', WEBHOOK_SECRET).update(`${t}.${rawBody}`, 'utf8').digest('hex');\nconst match = v1.some((sig) =>\n  sig.length === expected.length &&\n  crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected)));\nif (!match) return bad('signature_mismatch');\n\nconst age = Math.abs(Math.floor(Date.now() / 1000) - Number(t));\nif (age > TOLERANCE_SECONDS) return bad('timestamp_outside_tolerance');\n\nreturn [{ json: { valid: true, event: JSON.parse(rawBody) } }];"
+      },
+      "id": "399193d1-a3ae-406b-9e4b-a8154058af91",
+      "name": "Verify Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "665e1411-d199-4ae2-bf22-dfab3903f6a0",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ba486111-e589-4cce-a7bd-2868eb38f73e",
+      "name": "Signature Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "ok",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "d258a093-f82b-44a1-9590-b932056580ec",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "invalid signature",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "7ff5ce2d-782d-4df8-aa61-d906f2d1ac72",
+      "name": "Respond 400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Central config. Edit the values below.\nconst item = $input.first().json;\nreturn [{ json: {\n  event: item.event,\n  config: {\n    company_name: 'YOUR COMPANY LTD',\n    company_address: '1 Example Street, London, UK',\n    company_tax_id: 'GB000000000',\n    from_email: 'billing@yourdomain.com',\n    finance_email: 'finance@yourdomain.com',\n    erp_base_url: 'https://erp.example.com/api',\n    gotenberg_url: 'http://gotenberg:3000',\n    s3_bucket: 'finance-receipts',\n    stripe_api_version: '2025-03-31.basil',\n    template_version: 'receipt-v1.0'\n  }\n} }];"
+      },
+      "id": "9e25198f-a994-43a0-851e-406abbab4f0e",
+      "name": "Config & Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO stripe_events (event_id, event_type, payload, status) VALUES ($1, $2, $3::jsonb, 'received') ON CONFLICT (event_id) DO NOTHING RETURNING event_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.event.id, $json.event.type, JSON.stringify($json.event)] }}"
+        }
+      },
+      "id": "60226d01-8b2a-49d1-a130-6d91ed5438b7",
+      "name": "Store Event (Dedupe)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1200,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return [{ json: $('Config & Event').first().json }];"
+      },
+      "id": "2e6ecdc7-329e-40a7-aec3-0a402d2232f1",
+      "name": "Restore Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "26326d87-2c9b-4cd7-a0b8-a350b1176878",
+                    "leftValue": "={{ $json.event.type }}",
+                    "rightValue": "invoice.finalized",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renamedOutput": true,
+              "outputKey": "invoice.finalized"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "59d431aa-b481-4fa5-b10f-7c3492aa1b8a",
+                    "leftValue": "={{ $json.event.type }}",
+                    "rightValue": "invoice.paid",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renamedOutput": true,
+              "outputKey": "invoice.paid"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "5406d4dd-7dea-4e5f-9c34-d8c90a9d46e3",
+                    "leftValue": "={{ $json.event.type }}",
+                    "rightValue": "invoice.payment_failed",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renamedOutput": true,
+              "outputKey": "invoice.payment_failed"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "449ed61a-2f2c-45d6-8ad3-212ac0700001",
+                    "leftValue": "={{ $json.event.type }}",
+                    "rightValue": "charge.dispute.created",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renamedOutput": true,
+              "outputKey": "charge.dispute.created"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "b725b4ed-9792-4b1d-9fb8-0e6b0e8a29f3",
+                    "leftValue": "={{ $json.event.type }}",
+                    "rightValue": "credit_note.created",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renamedOutput": true,
+              "outputKey": "credit_note.created"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "b528d7e2-15dd-4747-9320-fba7bd39310f",
+      "name": "Route Event",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1680,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE stripe_events SET status = 'processed', processed_at = now() WHERE event_id = $1 RETURNING event_id;",
+        "options": {
+          "queryReplacement": "={{ [$('Restore Context').first().json.event.id] }}"
+        }
+      },
+      "id": "3292759c-ba24-4cf1-854b-dcfcae73b74e",
+      "name": "Mark Event Processed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        5400,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ZERO = ['bif','clp','djf','gnf','jpy','kmf','krw','mga','pyg','rwf','ugx','vnd','vuv','xaf','xof','xpf'];\nconst THREE = ['bhd','jod','kwd','omr','tnd'];\nconst major = (amt, cur) => {\n  const c = String(cur || '').toLowerCase();\n  const n = Number(amt || 0);\n  return ZERO.includes(c) ? n : THREE.includes(c) ? n / 1000 : n / 100;\n};\nconst taxOf = (o) => Array.isArray(o.total_taxes)\n  ? o.total_taxes.reduce((s, t) => s + (t.amount || 0), 0)\n  : (o.tax || 0);\nconst esc = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');\nconst isoDate = (unix) => new Date(unix * 1000).toISOString().slice(0, 10);\n\nconst inv = $json.event.data.object;\nconst cur = inv.currency;\nconst payload = {\n  external_reference: inv.id,\n  source: 'stripe',\n  document_type: 'customer_invoice',\n  invoice_number: inv.number,\n  stripe_customer_id: inv.customer,\n  erp_customer_id: inv.metadata?.erp_customer_id ?? null,\n  customer_name: inv.customer_name,\n  currency: String(cur).toUpperCase(),\n  invoice_date: isoDate(inv.status_transitions?.finalized_at || inv.created),\n  due_date: inv.due_date ? isoDate(inv.due_date) : null,\n  subtotal: major(inv.total_excluding_tax ?? (inv.total - taxOf(inv)), cur),\n  tax: major(taxOf(inv), cur),\n  total: major(inv.total, cur),\n  lines: (inv.lines?.data || []).map((l) => ({\n    description: l.description, quantity: l.quantity ?? 1, amount: major(l.amount, cur)\n  })),\n  lines_truncated: !!inv.lines?.has_more,\n  posting: { debit: 'ACCOUNTS_RECEIVABLE', credit: ['REVENUE_OR_DEFERRED', 'TAX_PAYABLE'] }\n};\nreturn [{ json: { idempotency_key: `stripe-invoice-finalized-${inv.id}`, erp_payload: payload } }];"
+      },
+      "id": "df3cc025-f39d-491c-97ce-ec6426698b77",
+      "name": "Build ERP Invoice",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        -380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config & Event').first().json.config.erp_base_url + '/invoices' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.idempotency_key }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.erp_payload) }}",
+        "options": {}
+      },
+      "id": "67740dcd-fcc7-47cf-b4b3-120942fc4563",
+      "name": "ERP: Create Invoice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2200,
+        -380
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://api.stripe.com/v1/invoices/' + $json.event.data.object.id + '?expand[]=customer&expand[]=customer.tax_ids' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "stripeApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Stripe-Version",
+              "value": "={{ $('Config & Event').first().json.config.stripe_api_version }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "9f54c302-519e-498a-b4d6-7116108dd955",
+      "name": "Get Invoice (Stripe)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1960,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://api.stripe.com/v1/invoice_payments?invoice=' + $json.id + '&status=paid&expand[]=data.payment.payment_intent.latest_charge' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "stripeApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Stripe-Version",
+              "value": "={{ $('Config & Event').first().json.config.stripe_api_version }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d2ee3144-46f4-4fe9-a16a-892a327fca89",
+      "name": "Get Invoice Payments",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2200,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ZERO = ['bif','clp','djf','gnf','jpy','kmf','krw','mga','pyg','rwf','ugx','vnd','vuv','xaf','xof','xpf'];\nconst THREE = ['bhd','jod','kwd','omr','tnd'];\nconst major = (amt, cur) => {\n  const c = String(cur || '').toLowerCase();\n  const n = Number(amt || 0);\n  return ZERO.includes(c) ? n : THREE.includes(c) ? n / 1000 : n / 100;\n};\nconst taxOf = (o) => Array.isArray(o.total_taxes)\n  ? o.total_taxes.reduce((s, t) => s + (t.amount || 0), 0)\n  : (o.tax || 0);\nconst esc = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');\nconst isoDate = (unix) => new Date(unix * 1000).toISOString().slice(0, 10);\n\nconst ctx = $('Restore Context').first().json;\nconst ev = ctx.event.data.object;                 // what the webhook claimed\nconst inv = $('Get Invoice (Stripe)').first().json; // what Stripe says now\nconst pays = $input.first().json || {};\nconst cust = inv.customer && typeof inv.customer === 'object' ? inv.customer : {};\nconst cur = inv.currency;\n\nconst reasons = [];\nif (inv.status !== 'paid') reasons.push(`Invoice status is \"${inv.status}\", expected \"paid\"`);\nif (inv.id !== ev.id) reasons.push('Re-fetched invoice ID does not match the event');\nif (inv.amount_paid !== ev.amount_paid) reasons.push(`Amount mismatch: event ${ev.amount_paid} vs API ${inv.amount_paid}`);\nif (String(inv.currency).toLowerCase() !== String(ev.currency).toLowerCase()) reasons.push('Currency mismatch between event and API');\nif (inv.amount_remaining !== 0) reasons.push(`Amount remaining is ${inv.amount_remaining}, expected 0`);\nif (!(inv.amount_paid > 0)) reasons.push('Zero-value payment, no cash to post');\nconst email = cust.email || inv.customer_email || null;\nif (!email) reasons.push('No billing email on customer or invoice');\nconst erpCustomerId = cust.metadata?.erp_customer_id || inv.metadata?.erp_customer_id || null;\nif (!erpCustomerId) reasons.push('Missing erp_customer_id in Stripe metadata');\n// TODO: add a lookup against your ERP/order record here and compare expected vs paid amount.\n\nconst pay = (pays.data || [])[0];\nconst pi = pay?.payment?.payment_intent && typeof pay.payment.payment_intent === 'object' ? pay.payment.payment_intent : null;\nconst charge = pi?.latest_charge && typeof pi.latest_charge === 'object' ? pi.latest_charge : null;\nconst pmd = charge?.payment_method_details || {};\nconst cc = String(cust.metadata?.billing_cc || '').split(',').map((s) => s.trim()).filter(Boolean);\n\nreturn [{ json: {\n  valid: reasons.length === 0,\n  reasons,\n  invoice_id: inv.id,\n  invoice_number: inv.number,\n  customer_name: cust.name || inv.customer_name,\n  customer_email: email,\n  cc,\n  customer_tax_ids: (cust.tax_ids?.data || []).map((t) => `${t.type}: ${t.value}`),\n  stripe_customer_id: typeof inv.customer === 'string' ? inv.customer : cust.id,\n  erp_customer_id: erpCustomerId,\n  currency: String(cur).toUpperCase(),\n  amount_paid_minor: inv.amount_paid,\n  amount_paid: major(inv.amount_paid, cur),\n  subtotal: major(inv.total_excluding_tax ?? (inv.total - taxOf(inv)), cur),\n  tax: major(taxOf(inv), cur),\n  total: major(inv.total, cur),\n  lines: (inv.lines?.data || []).map((l) => ({\n    description: l.description, quantity: l.quantity ?? 1, amount: major(l.amount, cur)\n  })),\n  paid_at_iso: new Date((inv.status_transitions?.paid_at || Math.floor(Date.now() / 1000)) * 1000).toISOString(),\n  payment_method_type: pmd.type || null,\n  card_brand: pmd.card?.brand || null,\n  card_last4: pmd.card?.last4 || null,\n  payment_intent_id: pi?.id || null,\n  charge_id: charge?.id || null,\n  balance_transaction_id: typeof charge?.balance_transaction === 'string' ? charge.balance_transaction : (charge?.balance_transaction?.id || null),\n  hosted_invoice_url: inv.hosted_invoice_url\n} }];"
+      },
+      "id": "26ff9cfd-da54-46fa-a758-609f65349437",
+      "name": "Validate Payment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "f64215cc-8b70-4456-b497-791ef4c4b695",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2375811b-b5de-4758-87b9-03c2eacba1e7",
+      "name": "Payment Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2680,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH x AS (INSERT INTO finance_exceptions (event_id, invoice_id, reasons) VALUES ($1, $2, $3::jsonb) RETURNING id) UPDATE stripe_events SET status = 'exception', processed_at = now() WHERE event_id = $1 RETURNING event_id;",
+        "options": {
+          "queryReplacement": "={{ [$('Restore Context').first().json.event.id, $json.invoice_id, JSON.stringify($json.reasons)] }}"
+        }
+      },
+      "id": "8b0a13cf-d31d-4ba4-8b23-5a645dbcc2f8",
+      "name": "Log Exception",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2920,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Config & Event').first().json.config.from_email }}",
+        "toEmail": "={{ $('Config & Event').first().json.config.finance_email }}",
+        "subject": "={{ '[Exception] Stripe payment needs review: ' + $('Validate Payment').first().json.invoice_id }}",
+        "emailFormat": "html",
+        "html": "={{ '<p>A paid-invoice event failed validation and was <b>not</b> posted or receipted.</p><p>Invoice: ' + $('Validate Payment').first().json.invoice_id + '<br>Event: ' + $('Restore Context').first().json.event.id + '</p><ul>' + $('Validate Payment').first().json.reasons.map(r => '<li>' + r + '</li>').join('') + '</ul>' }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "0c7eb0e0-bea1-422c-b090-ddb5f5ff01e0",
+      "name": "Alert Finance: Exception",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        3160,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const v = $input.first().json;\nconst payload = {\n  external_reference: `${v.invoice_id}:payment`,\n  source: 'stripe',\n  document_type: 'cash_receipt',\n  posting_date: v.paid_at_iso.slice(0, 10),\n  erp_customer_id: v.erp_customer_id,\n  stripe_customer_id: v.stripe_customer_id,\n  invoice_number: v.invoice_number,\n  currency: v.currency,\n  amount: v.amount_paid,\n  posting: { debit: 'STRIPE_CLEARING', credit: 'ACCOUNTS_RECEIVABLE' },\n  references: {\n    stripe_invoice_id: v.invoice_id,\n    payment_intent_id: v.payment_intent_id,\n    charge_id: v.charge_id,\n    balance_transaction_id: v.balance_transaction_id\n  }\n};\nreturn [{ json: { idempotency_key: `stripe-invoice-paid-${v.invoice_id}`, erp_payload: payload } }];"
+      },
+      "id": "f65a78cd-8c1e-4579-b3f3-0f1e843cc076",
+      "name": "Build ERP Payment Entry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2920,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config & Event').first().json.config.erp_base_url + '/cash-receipts' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.idempotency_key }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.erp_payload) }}",
+        "options": {}
+      },
+      "id": "31f6facc-c725-498b-bd1b-f462cd46ccd4",
+      "name": "ERP: Post Payment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3160,
+        -40
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ZERO = ['bif','clp','djf','gnf','jpy','kmf','krw','mga','pyg','rwf','ugx','vnd','vuv','xaf','xof','xpf'];\nconst THREE = ['bhd','jod','kwd','omr','tnd'];\nconst major = (amt, cur) => {\n  const c = String(cur || '').toLowerCase();\n  const n = Number(amt || 0);\n  return ZERO.includes(c) ? n : THREE.includes(c) ? n / 1000 : n / 100;\n};\nconst taxOf = (o) => Array.isArray(o.total_taxes)\n  ? o.total_taxes.reduce((s, t) => s + (t.amount || 0), 0)\n  : (o.tax || 0);\nconst esc = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');\nconst isoDate = (unix) => new Date(unix * 1000).toISOString().slice(0, 10);\n\nconst v = $('Validate Payment').first().json;\nconst cfg = $('Config & Event').first().json.config;\nconst fmt = (n) => new Intl.NumberFormat('en-GB', { style: 'currency', currency: v.currency }).format(n);\nconst receiptNo = `RCPT-${v.invoice_number || v.invoice_id}`;\nconst paidDate = v.paid_at_iso.slice(0, 10);\nconst method = v.payment_method_type === 'card'\n  ? `${v.card_brand || 'Card'} ending ${v.card_last4 || '****'}`\n  : (v.payment_method_type || 'Payment').replace(/_/g, ' ');\n\nconst rows = v.lines.map((l) =>\n  `<tr><td>${esc(l.description)}</td><td class=\"r\">${esc(l.quantity)}</td><td class=\"r\">${esc(fmt(l.amount))}</td></tr>`).join('');\n\nconst html = `<!doctype html><html><head><meta charset=\"utf-8\"><title>${esc(receiptNo)}</title>\n<style>\nbody{font-family:Helvetica,Arial,sans-serif;color:#1a1a1a;font-size:12px;margin:0;padding:40px}\nh1{font-size:22px;margin:0 0 4px} .muted{color:#666}\n.top{display:flex;justify-content:space-between;margin-bottom:28px}\n.badge{display:inline-block;background:#e6f4ea;color:#137333;border:1px solid #137333;padding:3px 10px;border-radius:4px;font-weight:bold;letter-spacing:1px}\n.cols{display:flex;gap:40px;margin:24px 0}\ntable{width:100%;border-collapse:collapse;margin-top:12px}\nth{text-align:left;border-bottom:2px solid #1a1a1a;padding:8px 4px}\ntd{padding:8px 4px;border-bottom:1px solid #ddd}\n.r{text-align:right} .tot td{border:none;padding:4px}\n.grand td{font-weight:bold;font-size:14px;border-top:2px solid #1a1a1a}\n.foot{margin-top:40px;font-size:10px;color:#777}\n</style></head><body>\n<div class=\"top\">\n  <div><b>${esc(cfg.company_name)}</b><br>${esc(cfg.company_address)}<br>Tax ID: ${esc(cfg.company_tax_id)}</div>\n  <div class=\"r\"><h1>PAYMENT RECEIPT</h1>${esc(receiptNo)}<br>Date paid: ${esc(paidDate)}<br><span class=\"badge\">PAID</span></div>\n</div>\n<div class=\"cols\">\n  <div><b>Billed to</b><br>${esc(v.customer_name)}<br>${esc(v.customer_email)}<br>${v.customer_tax_ids.map(esc).join('<br>')}</div>\n  <div><b>Payment details</b><br>Invoice: ${esc(v.invoice_number || v.invoice_id)}<br>Method: ${esc(method)}<br>Reference: ${esc(v.payment_intent_id || v.invoice_id)}</div>\n</div>\n<table><thead><tr><th>Description</th><th class=\"r\">Qty</th><th class=\"r\">Amount</th></tr></thead><tbody>${rows}</tbody></table>\n<table class=\"tot\" style=\"width:50%;margin-left:50%\">\n  <tr><td>Subtotal</td><td class=\"r\">${esc(fmt(v.subtotal))}</td></tr>\n  <tr><td>Tax</td><td class=\"r\">${esc(fmt(v.tax))}</td></tr>\n  <tr class=\"grand\"><td>Total paid</td><td class=\"r\">${esc(fmt(v.amount_paid))}</td></tr>\n</table>\n<p class=\"foot\">This receipt confirms full payment of invoice ${esc(v.invoice_number || v.invoice_id)}. Generated from ledger data. Template ${esc(cfg.template_version)}.</p>\n</body></html>`;\n\nconst emailHtml = `<p>Hello ${esc(v.customer_name || '')},</p>\n<p>We have received your payment. Your receipt is attached.</p>\n<table cellpadding=\"4\" style=\"border-collapse:collapse\">\n<tr><td>Invoice</td><td><b>${esc(v.invoice_number || v.invoice_id)}</b></td></tr>\n<tr><td>Amount paid</td><td><b>${esc(fmt(v.amount_paid))}</b></td></tr>\n<tr><td>Date</td><td>${esc(paidDate)}</td></tr>\n<tr><td>Method</td><td>${esc(method)}</td></tr>\n</table>\n<p>If anything looks wrong, just reply to this email.</p>\n<p>${esc(cfg.company_name)}</p>`;\n\nconst bin = await this.helpers.prepareBinaryData(Buffer.from(html, 'utf8'), 'index.html', 'text/html');\nreturn [{\n  json: {\n    receipt_number: receiptNo,\n    email_subject: `Payment received: invoice ${v.invoice_number || v.invoice_id} (${fmt(v.amount_paid)})`,\n    email_html: emailHtml\n  },\n  binary: { data: bin }\n}];"
+      },
+      "id": "b2c0d99a-e93a-474c-874b-9c7561bd7b48",
+      "name": "Build Receipt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3400,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config & Event').first().json.config.gotenberg_url + '/forms/chromium/convert/html' }}",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "files",
+              "inputDataFieldName": "data"
+            },
+            {
+              "name": "paperWidth",
+              "value": "8.27"
+            },
+            {
+              "name": "paperHeight",
+              "value": "11.7"
+            },
+            {
+              "name": "printBackground",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "receipt"
+            }
+          }
+        }
+      },
+      "id": "1408f347-bb69-42be-9f03-ac39deef90b5",
+      "name": "HTML to PDF (Gotenberg)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3640,
+        -40
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const crypto = require('crypto');\nconst item = $input.first();\nconst buf = await this.helpers.getBinaryDataBuffer(0, 'receipt');\nconst sha256 = crypto.createHash('sha256').update(buf).digest('hex');\n\nconst v = $('Validate Payment').first().json;\nconst b = $('Build Receipt').first().json;\nconst cfg = $('Config & Event').first().json.config;\n\nconst fileName = `${b.receipt_number}.pdf`;\nconst year = new Date(v.paid_at_iso).getUTCFullYear();\nconst s3Key = `receipts/${year}/${v.invoice_id}/${b.receipt_number}-${cfg.template_version}.pdf`;\n\nitem.binary.receipt.fileName = fileName;\nitem.binary.receipt.mimeType = 'application/pdf';\nreturn [{ json: { sha256, size_bytes: buf.length, file_name: fileName, s3_key: s3Key }, binary: item.binary }];"
+      },
+      "id": "51a732c2-c5f2-474f-b542-9a5364ad0fd1",
+      "name": "Hash PDF",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3880,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "upload",
+        "bucketName": "={{ $('Config & Event').first().json.config.s3_bucket }}",
+        "fileName": "={{ $json.s3_key }}",
+        "binaryData": true,
+        "binaryPropertyName": "receipt",
+        "additionalFields": {}
+      },
+      "id": "6165878f-4abe-4bdb-a934-c046a6ccc9f2",
+      "name": "Store PDF (S3)",
+      "type": "n8n-nodes-base.awsS3",
+      "typeVersion": 2,
+      "position": [
+        4120,
+        -40
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// S3 node output does not reliably carry the file forward, so restore it from the hashing step.\nconst h = $('Hash PDF').first();\nreturn [{ json: h.json, binary: h.binary }];"
+      },
+      "id": "54e8e55d-e715-4f73-9a79-d4c3e55106ce",
+      "name": "Reattach PDF",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4360,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Config & Event').first().json.config.from_email }}",
+        "toEmail": "={{ $('Validate Payment').first().json.customer_email }}",
+        "ccEmail": "={{ $('Validate Payment').first().json.cc.join(',') }}",
+        "bccEmail": "={{ $('Config & Event').first().json.config.finance_email }}",
+        "subject": "={{ $('Build Receipt').first().json.email_subject }}",
+        "emailFormat": "html",
+        "html": "={{ $('Build Receipt').first().json.email_html }}",
+        "options": {
+          "attachments": "receipt",
+          "appendAttribution": false
+        }
+      },
+      "id": "bca025ac-10bb-4817-859c-28af41ea3fe9",
+      "name": "Send Receipt Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        4600,
+        -40
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_id, invoice_id, action, details) VALUES ($1, $2, 'receipt_sent', $3::jsonb) RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [$('Restore Context').first().json.event.id, $('Validate Payment').first().json.invoice_id, JSON.stringify({ sha256: $('Hash PDF').first().json.sha256, s3_key: $('Hash PDF').first().json.s3_key, receipt_number: $('Build Receipt').first().json.receipt_number, sent_to: $('Validate Payment').first().json.customer_email, payment_intent_id: $('Validate Payment').first().json.payment_intent_id, charge_id: $('Validate Payment').first().json.charge_id })] }}"
+        }
+      },
+      "id": "4f3436f0-0b32-49bd-acbf-29dd0dfc47fe",
+      "name": "Write Audit Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4840,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ZERO = ['bif','clp','djf','gnf','jpy','kmf','krw','mga','pyg','rwf','ugx','vnd','vuv','xaf','xof','xpf'];\nconst THREE = ['bhd','jod','kwd','omr','tnd'];\nconst major = (amt, cur) => {\n  const c = String(cur || '').toLowerCase();\n  const n = Number(amt || 0);\n  return ZERO.includes(c) ? n : THREE.includes(c) ? n / 1000 : n / 100;\n};\nconst taxOf = (o) => Array.isArray(o.total_taxes)\n  ? o.total_taxes.reduce((s, t) => s + (t.amount || 0), 0)\n  : (o.tax || 0);\nconst esc = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');\nconst isoDate = (unix) => new Date(unix * 1000).toISOString().slice(0, 10);\n\nconst inv = $json.event.data.object;\nconst cfg = $('Config & Event').first().json.config;\nconst cur = inv.currency;\nconst amount = new Intl.NumberFormat('en-GB', { style: 'currency', currency: String(cur).toUpperCase() }).format(major(inv.amount_due, cur));\nconst html = `<p>Hello ${esc(inv.customer_name || '')},</p>\n<p>We could not collect payment of <b>${esc(amount)}</b> for invoice <b>${esc(inv.number || inv.id)}</b>.</p>\n<p><a href=\"${esc(inv.hosted_invoice_url)}\">Click here to retry payment or choose another method</a>.</p>\n<p>If you believe this is a mistake, reply to this email and we will help.</p><p>${esc(cfg.company_name)}</p>`;\nreturn [{ json: {\n  to: inv.customer_email,\n  subject: `Action needed: payment failed for invoice ${inv.number || inv.id}`,\n  html,\n  attempt_count: inv.attempt_count || 1,\n  invoice_id: inv.id\n} }];"
+      },
+      "id": "0674c060-69fd-44c8-8b94-1ecb1c56acfd",
+      "name": "Build Failure Notice",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Config & Event').first().json.config.from_email }}",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "html",
+        "html": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "52cc23ed-f563-43e8-b00f-4d886c879593",
+      "name": "Email Client: Payment Failed",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2200,
+        520
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "195e5378-ba6f-4a01-bfee-6cfa34085a8d",
+              "leftValue": "={{ $('Build Failure Notice').first().json.attempt_count }}",
+              "rightValue": 3,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5d998e8d-0157-47a7-ac63-93f9dab5f3ef",
+      "name": "3+ Failed Attempts?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2440,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Config & Event').first().json.config.from_email }}",
+        "toEmail": "={{ $('Config & Event').first().json.config.finance_email }}",
+        "subject": "={{ '[Dunning] Repeated payment failure: ' + $('Build Failure Notice').first().json.invoice_id }}",
+        "emailFormat": "html",
+        "html": "={{ '<p>Invoice ' + $('Build Failure Notice').first().json.invoice_id + ' has failed ' + $('Build Failure Notice').first().json.attempt_count + ' payment attempts. Please follow up with the client.</p>' }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "01f96ffa-995a-4780-a288-62a569cd21a5",
+      "name": "Alert Finance: Repeated Failure",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2680,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ZERO = ['bif','clp','djf','gnf','jpy','kmf','krw','mga','pyg','rwf','ugx','vnd','vuv','xaf','xof','xpf'];\nconst THREE = ['bhd','jod','kwd','omr','tnd'];\nconst major = (amt, cur) => {\n  const c = String(cur || '').toLowerCase();\n  const n = Number(amt || 0);\n  return ZERO.includes(c) ? n : THREE.includes(c) ? n / 1000 : n / 100;\n};\nconst taxOf = (o) => Array.isArray(o.total_taxes)\n  ? o.total_taxes.reduce((s, t) => s + (t.amount || 0), 0)\n  : (o.tax || 0);\nconst esc = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');\nconst isoDate = (unix) => new Date(unix * 1000).toISOString().slice(0, 10);\n\nconst d = $json.event.data.object;\nconst amt = new Intl.NumberFormat('en-GB', { style: 'currency', currency: String(d.currency).toUpperCase() }).format(major(d.amount, d.currency));\nconst due = d.evidence_details?.due_by ? new Date(d.evidence_details.due_by * 1000).toISOString().slice(0, 10) : 'n/a';\nconst html = `<p><b>A payment dispute was opened.</b> Related invoices should be frozen until it is resolved.</p>\n<ul><li>Dispute: ${esc(d.id)}</li><li>Charge: ${esc(d.charge)}</li><li>Payment intent: ${esc(d.payment_intent || 'n/a')}</li>\n<li>Amount: ${esc(amt)}</li><li>Reason: ${esc(d.reason)}</li><li>Evidence due by: ${esc(due)}</li></ul>\n<p><a href=\"https://dashboard.stripe.com/disputes/${esc(d.id)}\">Open in Stripe</a></p>`;\nreturn [{ json: { subject: `[ACTION] Stripe dispute opened: ${amt} (${d.reason}), evidence due ${due}`, html } }];"
+      },
+      "id": "3626ba97-62b5-4e07-8aec-d9eac073d069",
+      "name": "Build Dispute Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Config & Event').first().json.config.from_email }}",
+        "toEmail": "={{ $('Config & Event').first().json.config.finance_email }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "html",
+        "html": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "273cad10-eee5-47c1-9692-2924242e3455",
+      "name": "Alert Finance: Dispute",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2200,
+        800
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ZERO = ['bif','clp','djf','gnf','jpy','kmf','krw','mga','pyg','rwf','ugx','vnd','vuv','xaf','xof','xpf'];\nconst THREE = ['bhd','jod','kwd','omr','tnd'];\nconst major = (amt, cur) => {\n  const c = String(cur || '').toLowerCase();\n  const n = Number(amt || 0);\n  return ZERO.includes(c) ? n : THREE.includes(c) ? n / 1000 : n / 100;\n};\nconst taxOf = (o) => Array.isArray(o.total_taxes)\n  ? o.total_taxes.reduce((s, t) => s + (t.amount || 0), 0)\n  : (o.tax || 0);\nconst esc = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');\nconst isoDate = (unix) => new Date(unix * 1000).toISOString().slice(0, 10);\n\nconst cn = $json.event.data.object;\nconst cur = cn.currency;\nconst tax = Array.isArray(cn.total_taxes)\n  ? cn.total_taxes.reduce((s, t) => s + (t.amount || 0), 0)\n  : (cn.tax_amounts || []).reduce((s, t) => s + (t.amount || 0), 0);\nconst payload = {\n  external_reference: cn.id,\n  source: 'stripe',\n  document_type: 'credit_note',\n  credit_note_number: cn.number,\n  related_stripe_invoice_id: cn.invoice,\n  stripe_customer_id: cn.customer,\n  currency: String(cur).toUpperCase(),\n  total: major(cn.total, cur),\n  tax: major(tax, cur),\n  reason: cn.reason,\n  memo: cn.memo,\n  pdf_url: cn.pdf,\n  posting_date: isoDate(cn.created),\n  posting: { note: 'Reverse revenue/tax and AR. If refunded, reverse through STRIPE_CLEARING.' }\n};\nreturn [{ json: { idempotency_key: `stripe-credit-note-${cn.id}`, erp_payload: payload } }];"
+      },
+      "id": "98914e2d-f383-4cb4-9d8f-d8a53849ecb1",
+      "name": "Build ERP Credit Note",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        1060
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config & Event').first().json.config.erp_base_url + '/credit-notes' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.idempotency_key }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.erp_payload) }}",
+        "options": {}
+      },
+      "id": "e48ddb8d-b3c2-4c9b-89ff-87993a454e2b",
+      "name": "ERP: Post Credit Note",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2200,
+        1060
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {},
+      "id": "7d70fbd1-aace-4fed-acc9-d40c4db45aa2",
+      "name": "Ignored Event",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1960,
+        1300
+      ]
+    }
+  ],
+  "connections": {
+    "Stripe Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Signature": {
+      "main": [
+        [
+          {
+            "node": "Signature Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signature Valid?": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 400",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond 200": {
+      "main": [
+        [
+          {
+            "node": "Config & Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config & Event": {
+      "main": [
+        [
+          {
+            "node": "Store Event (Dedupe)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Event (Dedupe)": {
+      "main": [
+        [
+          {
+            "node": "Restore Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Context": {
+      "main": [
+        [
+          {
+            "node": "Route Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Event": {
+      "main": [
+        [
+          {
+            "node": "Build ERP Invoice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Invoice (Stripe)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Failure Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Dispute Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build ERP Credit Note",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ignored Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build ERP Invoice": {
+      "main": [
+        [
+          {
+            "node": "ERP: Create Invoice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ERP: Create Invoice": {
+      "main": [
+        [
+          {
+            "node": "Mark Event Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Payment Valid?": {
+      "main": [
+        [
+          {
+            "node": "Build ERP Payment Entry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Exception",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Exception": {
+      "main": [
+        [
+          {
+            "node": "Alert Finance: Exception",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Invoice (Stripe)": {
+      "main": [
+        [
+          {
+            "node": "Get Invoice Payments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Invoice Payments": {
+      "main": [
+        [
+          {
+            "node": "Validate Payment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Payment": {
+      "main": [
+        [
+          {
+            "node": "Payment Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build ERP Payment Entry": {
+      "main": [
+        [
+          {
+            "node": "ERP: Post Payment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ERP: Post Payment": {
+      "main": [
+        [
+          {
+            "node": "Build Receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Receipt": {
+      "main": [
+        [
+          {
+            "node": "HTML to PDF (Gotenberg)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTML to PDF (Gotenberg)": {
+      "main": [
+        [
+          {
+            "node": "Hash PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash PDF": {
+      "main": [
+        [
+          {
+            "node": "Store PDF (S3)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store PDF (S3)": {
+      "main": [
+        [
+          {
+            "node": "Reattach PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reattach PDF": {
+      "main": [
+        [
+          {
+            "node": "Send Receipt Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Receipt Email": {
+      "main": [
+        [
+          {
+            "node": "Write Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Audit Log": {
+      "main": [
+        [
+          {
+            "node": "Mark Event Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Failure Notice": {
+      "main": [
+        [
+          {
+            "node": "Email Client: Payment Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Client: Payment Failed": {
+      "main": [
+        [
+          {
+            "node": "3+ Failed Attempts?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3+ Failed Attempts?": {
+      "main": [
+        [
+          {
+            "node": "Alert Finance: Repeated Failure",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Event Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Finance: Repeated Failure": {
+      "main": [
+        [
+          {
+            "node": "Mark Event Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Dispute Alert": {
+      "main": [
+        [
+          {
+            "node": "Alert Finance: Dispute",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Finance: Dispute": {
+      "main": [
+        [
+          {
+            "node": "Mark Event Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build ERP Credit Note": {
+      "main": [
+        [
+          {
+            "node": "ERP: Post Credit Note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ERP: Post Credit Note": {
+      "main": [
+        [
+          {
+            "node": "Mark Event Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ignored Event": {
+      "main": [
+        [
+          {
+            "node": "Mark Event Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
